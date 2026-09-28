@@ -20,6 +20,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential libssl-dev pkg-config e2fsprogs patchelf git-lfs
           rustup toolchain install 1.98.1 --profile minimal
+          rustup component add --toolchain 1.98.1 rustfmt
           GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 --branch v1.17.0 https://github.com/smol-machines/smolvm.git upstream
           cd upstream
           test "$(git rev-parse HEAD)" = d33b5a4adeb844365922cd2a29a89d93a94008ad
