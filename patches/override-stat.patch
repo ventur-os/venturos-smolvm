@@ -1,0 +1,742 @@
+diff --git a/README.md b/README.md
+index 12e0fc8..88d2821 100644
+--- a/README.md
++++ b/README.md
+@@ -232,6 +232,14 @@ machine needs a stop/start to apply it. DAX does not materially accelerate
+ metadata-heavy traversal. Confirm it in the guest with
+ `grep virtiofs /proc/mounts`; an active mount includes `dax=always`.
+ 
++On Linux, a writable host volume whose files carry
++`user.containers.override_stat` metadata can opt in per mount with
++`-v /host/website:/website-workspaces:override-stat`, or with
++`"overrideStat": true` on that mount in the HTTP create request. The choice
++is persisted across machine restarts; other mounts keep their normal ownership
++and mode handling. The selected volume requires a libkrun that exports
++`krun_add_virtiofs4` and a host filesystem that supports the xattr.
++
+ **Use git and SSH without copying private keys into the guest.** Forward your host SSH agent into the VM. The guest can ask the agent to sign with any forwarded key while the socket is available, so forward it only to workloads you trust. Requires an SSH agent running on your host (`ssh-add -l` to check).
+ 
+ ```bash
+diff --git a/src/agent/launcher.rs b/src/agent/launcher.rs
+index 22867f8..65014e7 100644
+--- a/src/agent/launcher.rs
++++ b/src/agent/launcher.rs
+@@ -695,6 +695,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
+                         target: std::path::PathBuf::from("/opt/smolvm-ring"),
+                         read_only: false,
+                         staged: false,
++                        override_stat: false,
+                     });
+                 }
+             }
+@@ -1836,7 +1837,30 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
+             // guest-side remount, but it cannot make the host server accept
+             // writes. Fail closed if the symbol is missing rather than
+             // silently attaching the mount writable.
+-            if mount.read_only || dax_window > 0 {
++            if mount.override_stat {
++                let Some(add_virtiofs4) = krun.add_virtiofs4 else {
++                    krun_free_ctx(ctx);
++                    return Err(Error::agent(
++                        "add virtiofs mount",
++                        "override-stat mount requires libkrun with krun_add_virtiofs4",
++                    ));
++                };
++                if add_virtiofs4(
++                    ctx,
++                    tag.as_ptr(),
++                    host_path.as_ptr(),
++                    dax_window,
++                    mount.read_only,
++                    super::krun::KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT,
++                ) < 0
++                {
++                    krun_free_ctx(ctx);
++                    return Err(Error::agent(
++                        "add virtiofs mount",
++                        format!("krun_add_virtiofs4 failed for '{}'", mount.source.display()),
++                    ));
++                }
++            } else if mount.read_only || dax_window > 0 {
+                 let Some(add_virtiofs3) = krun_add_virtiofs3 else {
+                     if mount.read_only {
+                         krun_free_ctx(ctx);
+diff --git a/src/agent/launcher_dynamic.rs b/src/agent/launcher_dynamic.rs
+index 2f121e5..1f10bda 100644
+--- a/src/agent/launcher_dynamic.rs
++++ b/src/agent/launcher_dynamic.rs
+@@ -44,6 +44,8 @@ pub struct PackedMount {
+     pub read_only: bool,
+     /// Whether the guest uses a local staged working copy.
+     pub staged: bool,
++    /// Use per-file override-stat xattrs for guest ownership and mode.
++    pub override_stat: bool,
+ }
+ 
+ /// Configuration for launching a packed VM.
+@@ -908,16 +910,32 @@ pub fn launch_agent_vm_dynamic(
+ 
+         let dax_window = super::virtiofs::user_mount_dax_window(Path::new(&mount.guest_path));
+         // SAFETY: ctx is valid, tag and host_path are valid C strings
+-        if unsafe {
+-            add_virtiofs3(
+-                ctx,
+-                tag.as_ptr(),
+-                host_path.as_ptr(),
+-                dax_window,
+-                mount.read_only,
+-            )
+-        } < 0
+-        {
++        let added = if mount.override_stat {
++            let Some(add_virtiofs4) = krun.add_virtiofs4 else {
++                free_ctx_on_err!("override-stat mount requires libkrun with krun_add_virtiofs4");
++            };
++            unsafe {
++                add_virtiofs4(
++                    ctx,
++                    tag.as_ptr(),
++                    host_path.as_ptr(),
++                    dax_window,
++                    mount.read_only,
++                    super::krun::KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT,
++                )
++            }
++        } else {
++            unsafe {
++                add_virtiofs3(
++                    ctx,
++                    tag.as_ptr(),
++                    host_path.as_ptr(),
++                    dax_window,
++                    mount.read_only,
++                )
++            }
++        };
++        if added < 0 {
+             free_ctx_on_err!(format!(
+                 "krun_add_virtiofs failed for '{}' - requested mount cannot be attached",
+                 mount.tag
+diff --git a/src/agent/manager.rs b/src/agent/manager.rs
+index 763bda1..a536123 100644
+--- a/src/agent/manager.rs
++++ b/src/agent/manager.rs
+@@ -245,6 +245,7 @@ pub fn docker_config_mount() -> Option<HostMount> {
+         target: PathBuf::from("/root/.docker"),
+         read_only: true,
+         staged: false,
++        override_stat: false,
+     })
+ }
+ 
+diff --git a/src/agent/mod.rs b/src/agent/mod.rs
+index d8fe8f0..5dd59ea 100644
+--- a/src/agent/mod.rs
++++ b/src/agent/mod.rs
+@@ -87,6 +87,7 @@ pub use client::{
+     InteractiveInput, InteractiveOutput, PullOptions, RunConfig,
+ };
+ pub use fsnotify_watch::FsNotifyWatcher;
++pub(crate) use krun::KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT;
+ pub use krun::{host_layers_supported, KrunFunctions};
+ pub use launcher::{
+     create_disk_overlays, find_lib_dir, launch_agent_vm, DiskOverlaySpec, LaunchConfig,
+diff --git a/src/api/handlers/machines.rs b/src/api/handlers/machines.rs
+index 631a851..8a71f72 100644
+--- a/src/api/handlers/machines.rs
++++ b/src/api/handlers/machines.rs
+@@ -94,6 +94,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
+                 target: mount.target.to_string_lossy().into_owned(),
+                 readonly: mount.read_only,
+                 staged: mount.staged,
++                override_stat: mount.override_stat,
+             })
+             .collect(),
+         ports: record
+@@ -1806,6 +1807,11 @@ async fn create_machine_inner(
+     let mut host_mount_specs: Vec<crate::api::types::MountSpec> = Vec::new();
+     for m in &req.mounts {
+         if crate::remote_volume::is_remote_source(&m.source) {
++            if m.override_stat {
++                return Err(ApiError::BadRequest(
++                    "overrideStat requires a host-directory mount".into(),
++                ));
++            }
+             remote_volumes.push(
+                 crate::remote_volume::from_parts(&m.source, &m.target, m.readonly)
+                     .map_err(|e| ApiError::BadRequest(e.to_string()))?,
+diff --git a/src/api/state.rs b/src/api/state.rs
+index d80e104..7809bd4 100644
+--- a/src/api/state.rs
++++ b/src/api/state.rs
+@@ -1038,6 +1038,11 @@ impl ApiState {
+             reg.restart.clone(),
+         );
+         record.staged_mounts = staged_mounts;
++        record.override_stat_targets = host_mounts
++            .iter()
++            .filter(|mount| mount.override_stat)
++            .map(|mount| mount.target.to_string_lossy().into_owned())
++            .collect();
+         record.storage_gb = reg.resources.storage_gb;
+         record.overlay_gb = reg.resources.overlay_gb;
+         record.block_io = reg.resources.block_io.unwrap_or_default();
+@@ -1598,6 +1603,12 @@ impl TryFrom<&MountSpec> for HostMount {
+                 "a mount cannot be both readonly and staged",
+             ));
+         }
++        if spec.override_stat && (spec.readonly || spec.staged) {
++            return Err(crate::Error::mount(
++                "validate mount mode",
++                "override-stat requires a live writable mount",
++            ));
++        }
+         let source = Path::new(&spec.source);
+         if !source.is_absolute() {
+             return Err(crate::Error::mount(
+@@ -1608,6 +1619,7 @@ impl TryFrom<&MountSpec> for HostMount {
+ 
+         let mut mount = HostMount::new(&spec.source, &spec.target, spec.readonly)?;
+         mount.staged = spec.staged;
++        mount.override_stat = spec.override_stat;
+         Ok(mount)
+     }
+ }
+@@ -1619,6 +1631,7 @@ impl From<&HostMount> for MountSpec {
+             target: mount.target.to_string_lossy().to_string(),
+             readonly: mount.read_only,
+             staged: mount.staged,
++            override_stat: mount.override_stat,
+         }
+     }
+ }
+@@ -1756,6 +1769,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo
+                 target: m.target.clone(),
+                 readonly: m.readonly,
+                 staged: m.staged,
++                override_stat: m.override_stat,
+             })
+             .collect(),
+         ports: entry.ports.clone(),
+@@ -1843,12 +1857,26 @@ mod tests {
+ 
+     #[test]
+     fn test_type_conversions() {
++        let selected: MountSpec = serde_json::from_value(serde_json::json!({
++            "source": "/tmp", "target": "/website-workspaces", "overrideStat": true
++        }))
++        .unwrap();
++        assert!(HostMount::try_from(&selected).unwrap().override_stat);
++        assert!(serde_json::to_value(&selected).unwrap()["overrideStat"] == true);
++        let mut invalid = selected.clone();
++        invalid.readonly = true;
++        assert!(HostMount::try_from(&invalid).is_err());
++        invalid.readonly = false;
++        invalid.staged = true;
++        assert!(HostMount::try_from(&invalid).is_err());
++
+         // MountSpec -> HostMount preserves readonly flag (use /tmp which exists)
+         let spec = MountSpec {
+             source: "/tmp".into(),
+             target: "/guest".into(),
+             readonly: true,
+             staged: false,
++            override_stat: false,
+         };
+         assert!(HostMount::try_from(&spec).unwrap().read_only);
+ 
+@@ -1857,6 +1885,7 @@ mod tests {
+             target: "/guest".into(),
+             readonly: false,
+             staged: false,
++            override_stat: false,
+         };
+         assert!(!HostMount::try_from(&spec).unwrap().read_only);
+ 
+@@ -1867,6 +1896,7 @@ mod tests {
+             target: "/host/etc".into(),
+             readonly: true,
+             staged: false,
++            override_stat: false,
+         };
+         assert!(HostMount::try_from(&system_spec).is_err());
+ 
+diff --git a/src/api/types.rs b/src/api/types.rs
+index f2c0501..a07f9a7 100644
+--- a/src/api/types.rs
++++ b/src/api/types.rs
+@@ -47,6 +47,9 @@ pub struct MountSpec {
+     /// Use a guest-local working copy and synchronize it in batches.
+     #[serde(default)]
+     pub staged: bool,
++    /// Use user.containers.override_stat for this writable host share.
++    #[serde(default, rename = "overrideStat")]
++    pub override_stat: bool,
+ }
+ 
+ /// Mount information (for responses, includes virtiofs tag).
+@@ -65,6 +68,9 @@ pub struct MountInfo {
+     pub readonly: bool,
+     /// Whether this is a guest-local staged mount.
+     pub staged: bool,
++    /// Whether this share uses override-stat metadata.
++    #[serde(rename = "overrideStat")]
++    pub override_stat: bool,
+ }
+ 
+ /// Port mapping specification.
+diff --git a/src/cli/machine.rs b/src/cli/machine.rs
+index ccdf302..ac2094c 100644
+--- a/src/cli/machine.rs
++++ b/src/cli/machine.rs
+@@ -549,7 +549,7 @@ pub struct RunCmd {
+     #[arg(
+         short = 'v',
+         long = "volume",
+-        value_name = "HOST|REMOTE:CONTAINER[:ro|rw|staged]",
++        value_name = "HOST|REMOTE:CONTAINER[:ro|rw|staged|override-stat]",
+         help_heading = "Container"
+     )]
+     pub volume: Vec<String>,
+@@ -1943,6 +1943,11 @@ impl RunCmd {
+                                     &params,
+                                     mount_tuples,
+                                     staged_mounts,
++                                    mounts
++                                        .iter()
++                                        .filter(|m| m.override_stat)
++                                        .map(|m| m.target.to_string_lossy().into_owned())
++                                        .collect(),
+                                     port_tuples,
+                                 );
+                                 // An image machine records what the image
+@@ -2108,6 +2113,11 @@ impl RunCmd {
+                                 &params,
+                                 mount_tuples,
+                                 staged_mounts,
++                                mounts
++                                    .iter()
++                                    .filter(|m| m.override_stat)
++                                    .map(|m| m.target.to_string_lossy().into_owned())
++                                    .collect(),
+                                 port_tuples,
+                             );
+                             // A one-shot run keeps no image on its record; the
+@@ -3355,7 +3365,7 @@ pub struct CreateCmd {
+     #[arg(
+         short = 'v',
+         long = "volume",
+-        value_name = "HOST|REMOTE:GUEST[:ro|rw|staged]"
++        value_name = "HOST|REMOTE:GUEST[:ro|rw|staged|override-stat]"
+     )]
+     pub volume: Vec<String>,
+ 
+@@ -4875,7 +4885,11 @@ pub struct UpdateCmd {
+ 
+     /// Add volume mount. A staged mount is guest-local until sync or graceful stop;
+     /// do not modify its host source concurrently.
+-    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro|rw|staged]")]
++    #[arg(
++        short = 'v',
++        long = "volume",
++        value_name = "HOST:GUEST[:ro|rw|staged|override-stat]"
++    )]
+     pub volume: Vec<String>,
+ 
+     /// Allow adding trusted read-only host `/etc` and `/var/log` mounts below
+@@ -5044,6 +5058,7 @@ impl UpdateCmd {
+                 .strip_suffix(":ro")
+                 .or_else(|| rm.strip_suffix(":rw"))
+                 .or_else(|| rm.strip_suffix(":staged"))
++                .or_else(|| rm.strip_suffix(":override-stat"))
+                 .unwrap_or(rm);
+             let canonical_rm = if let Some((rm_src, rm_tgt)) = rm_without_mode.rsplit_once(':') {
+                 let resolved = std::fs::canonicalize(rm_src)
+@@ -5109,6 +5124,11 @@ impl UpdateCmd {
+                 }
+                 r.mounts = final_live_mounts.clone();
+                 r.staged_mounts = final_staged_mounts.clone();
++                r.override_stat_targets = final_mounts
++                    .iter()
++                    .filter(|mount| mount.override_stat)
++                    .map(|mount| mount.target.to_string_lossy().into_owned())
++                    .collect();
+             }
+ 
+             // Ports: add new, remove specified
+diff --git a/src/cli/pack_run.rs b/src/cli/pack_run.rs
+index 60ac83c..1206b99 100644
+--- a/src/cli/pack_run.rs
++++ b/src/cli/pack_run.rs
+@@ -154,6 +154,7 @@ fn mounts_to_packed(mounts: &[smolvm::data::storage::HostMount]) -> Vec<PackedMo
+             guest_path: m.target.to_string_lossy().to_string(),
+             read_only: m.read_only,
+             staged: m.staged,
++            override_stat: m.override_stat,
+         })
+         .collect()
+ }
+@@ -1319,7 +1320,11 @@ struct PackedRunArgs {
+     env: Vec<String>,
+ 
+     /// Mount a volume (HOST:GUEST[:ro|rw|staged])
+-    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro|rw|staged]")]
++    #[arg(
++        short = 'v',
++        long = "volume",
++        value_name = "HOST:GUEST[:ro|rw|staged|override-stat]"
++    )]
+     volume: Vec<String>,
+ 
+     /// Allow trusted read-only host `/etc` and `/var/log` mounts below `/host`.
+@@ -1390,7 +1395,11 @@ struct PackedStartArgs {
+     block_io: Option<BlockIoEngine>,
+ 
+     /// Mount a volume (HOST:GUEST[:ro|rw|staged])
+-    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro|rw|staged]")]
++    #[arg(
++        short = 'v',
++        long = "volume",
++        value_name = "HOST:GUEST[:ro|rw|staged|override-stat]"
++    )]
+     volume: Vec<String>,
+ 
+     /// Allow trusted read-only host `/etc` and `/var/log` mounts below `/host`.
+diff --git a/src/cli/parsers.rs b/src/cli/parsers.rs
+index 8d51df8..8099976 100644
+--- a/src/cli/parsers.rs
++++ b/src/cli/parsers.rs
+@@ -244,6 +244,7 @@ mod tests {
+             target: PathBuf::from("/app"),
+             read_only: true,
+             staged: false,
++            override_stat: false,
+         };
+         let from_parsed = mounts_to_virtiofs_bindings(&[host_mount]);
+         let from_record =
+@@ -260,12 +261,14 @@ mod tests {
+                 target: PathBuf::from("/live"),
+                 read_only: false,
+                 staged: false,
++                override_stat: false,
+             },
+             HostMount {
+                 source: PathBuf::from("/tmp"),
+                 target: PathBuf::from("/staged"),
+                 read_only: false,
+                 staged: true,
++                override_stat: false,
+             },
+         ];
+         assert_eq!(
+diff --git a/src/cli/smolfile.rs b/src/cli/smolfile.rs
+index ac26666..d3d8809 100644
+--- a/src/cli/smolfile.rs
++++ b/src/cli/smolfile.rs
+@@ -649,7 +649,8 @@ init = ["echo init"]
+ 
+         // Hop 2b: create params -> overrides -> record, the `run` and
+         // first-launch paths.
+-        let overrides = DefaultVmOverrides::from_create_params(&params, vec![], vec![], vec![]);
++        let overrides =
++            DefaultVmOverrides::from_create_params(&params, vec![], vec![], vec![], vec![]);
+         let mut persisted = VmRecord::new("parity".to_string(), 1, 512, vec![], vec![], true);
+         apply_overrides(&mut persisted, &overrides);
+         assert_eq!(persisted.image, params.image);
+diff --git a/src/cli/vm_common.rs b/src/cli/vm_common.rs
+index bcc37b5..298dfee 100644
+--- a/src/cli/vm_common.rs
++++ b/src/cli/vm_common.rs
+@@ -715,6 +715,11 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
+         restart,
+     );
+     record.staged_mounts = staged_mounts;
++    record.override_stat_targets = parsed_mounts
++        .iter()
++        .filter(|mount| mount.override_stat)
++        .map(|mount| mount.target.to_string_lossy().into_owned())
++        .collect();
+     record.init = params.init.clone();
+     record.remote_volumes = remote_volumes;
+     record.env = env;
+@@ -1924,6 +1929,7 @@ pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
+     r.mem = o.mem;
+     r.mounts = o.mounts.clone();
+     r.staged_mounts = o.staged_mounts.clone();
++    r.override_stat_targets = o.override_stat_targets.clone();
+     r.ports = o.ports.clone();
+     r.network = o.network;
+     r.network_backend = o.network_backend;
+@@ -1995,6 +2001,7 @@ pub struct DefaultVmOverrides {
+     pub mem: u32,
+     pub mounts: Vec<(String, String, bool)>,
+     pub staged_mounts: Vec<(usize, String, String)>,
++    pub override_stat_targets: Vec<String>,
+     pub ports: Vec<(u16, u16)>,
+     pub network: bool,
+     pub network_backend: Option<NetworkBackend>,
+@@ -2035,6 +2042,7 @@ impl DefaultVmOverrides {
+         params: &CreateVmParams,
+         mounts: Vec<(String, String, bool)>,
+         staged_mounts: Vec<(usize, String, String)>,
++        override_stat_targets: Vec<String>,
+         ports: Vec<(u16, u16)>,
+     ) -> Self {
+         Self {
+@@ -2043,6 +2051,7 @@ impl DefaultVmOverrides {
+             mem: params.mem,
+             mounts,
+             staged_mounts,
++            override_stat_targets,
+             ports,
+             network: params.net,
+             network_backend: params.network_backend,
+@@ -3256,6 +3265,11 @@ pub fn register_ephemeral_vm(
+     let (live_mounts, staged_mounts) = HostMount::split_storage_tuples(mounts);
+     let mut record = VmRecord::new(name.to_string(), cpus, mem, live_mounts, vec![], network);
+     record.staged_mounts = staged_mounts;
++    record.override_stat_targets = mounts
++        .iter()
++        .filter(|mount| mount.override_stat)
++        .map(|mount| mount.target.to_string_lossy().into_owned())
++        .collect();
+     record.ephemeral = true;
+     record.state = RecordState::Running;
+     record.pid = pid;
+diff --git a/src/config.rs b/src/config.rs
+index 6e48b2f..cb5b8b9 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -403,6 +403,10 @@ pub struct VmRecord {
+     #[serde(default)]
+     pub mounts: Vec<(String, String, bool)>,
+ 
++    /// Guest targets whose host shares use virtiofs override-stat metadata.
++    #[serde(default, skip_serializing_if = "Vec::is_empty")]
++    pub override_stat_targets: Vec<String>,
++
+     /// Guest-local working trees synchronized with host directories in
+     /// batches. Kept separate from `mounts` so existing records retain their
+     /// tuple encoding and cannot accidentally reinterpret a staged mount as a
+@@ -720,6 +724,7 @@ impl VmRecord {
+             block_io: Default::default(),
+             disks: Vec::new(),
+             mounts,
++            override_stat_targets: Vec::new(),
+             staged_mounts: Vec::new(),
+             ports,
+             published_sockets: Vec::new(),
+@@ -794,6 +799,7 @@ impl VmRecord {
+             block_io: Default::default(),
+             disks: Vec::new(),
+             mounts,
++            override_stat_targets: Vec::new(),
+             staged_mounts: Vec::new(),
+             ports,
+             published_sockets: Vec::new(),
+@@ -882,6 +888,10 @@ impl VmRecord {
+                 target: std::path::PathBuf::from(guest),
+                 read_only: *ro,
+                 staged: false,
++                override_stat: self
++                    .override_stat_targets
++                    .iter()
++                    .any(|target| target == guest),
+             })
+             .collect::<std::collections::VecDeque<_>>();
+         let staged = self
+diff --git a/src/data/storage.rs b/src/data/storage.rs
+index 54d3b5c..4f10e4b 100644
+--- a/src/data/storage.rs
++++ b/src/data/storage.rs
+@@ -43,6 +43,10 @@ pub struct HostMount {
+     /// host/guest coherence for metadata-heavy workload performance.
+     #[serde(default)]
+     pub staged: bool,
++
++    /// Read ownership/mode from user.containers.override_stat on this share.
++    #[serde(default)]
++    pub override_stat: bool,
+ }
+ 
+ impl HostMount {
+@@ -117,6 +121,7 @@ impl HostMount {
+             target: target.into(),
+             read_only,
+             staged: false,
++            override_stat: false,
+         };
+ 
+         if !mount.source.exists() {
+@@ -149,7 +154,7 @@ impl HostMount {
+         Ok(mount)
+     }
+ 
+-    /// Parse a mount specification (`host_path:guest_path[:ro|:rw]`).
++    /// Parse a mount specification (`host_path:guest_path[:ro|:rw|:staged|:override-stat]`).
+     ///
+     /// If no mode is provided, the mount defaults to writable.
+     /// The source path is validated, required to be a directory, and canonicalized.
+@@ -158,21 +163,23 @@ impl HostMount {
+         // colon (e.g. `C:\data:/data:ro`). The guest path is a Unix path with no
+         // colon, and the optional trailing mode is `ro`/`rw`; everything before
+         // the guest path is the host source.
+-        let (rest, read_only, staged) = match spec.rsplit_once(':') {
+-            Some((head, "ro")) => (head, true, false),
+-            Some((head, "rw")) => (head, false, false),
+-            Some((head, "staged")) => (head, false, true),
+-            _ => (spec, false, false),
++        let (rest, read_only, staged, override_stat) = match spec.rsplit_once(':') {
++            Some((head, "ro")) => (head, true, false, false),
++            Some((head, "rw")) => (head, false, false, false),
++            Some((head, "staged")) => (head, false, true, false),
++            Some((head, "override-stat")) => (head, false, false, true),
++            _ => (spec, false, false, false),
+         };
+         match rest.rsplit_once(':') {
+             Some((source, target)) if !source.is_empty() && !target.is_empty() => {
+                 let mut mount =
+                     Self::new_with_system_mounts(source, target, read_only, allow_system_mounts)?;
+                 mount.staged = staged;
++                mount.override_stat = override_stat;
+                 Ok(mount)
+             }
+             _ => Err(Error::invalid_mount_path(format!(
+-                "invalid format '{}' (expected host:guest[:ro|:rw|:staged])",
++                "invalid format '{}' (expected host:guest[:ro|:rw|:staged|:override-stat])",
+                 spec
+             ))),
+         }
+@@ -346,6 +353,7 @@ impl HostMount {
+             target: PathBuf::from(target),
+             read_only,
+             staged: false,
++            override_stat: false,
+         }
+     }
+ 
+@@ -356,6 +364,7 @@ impl HostMount {
+             target: PathBuf::from(target),
+             read_only: false,
+             staged: true,
++            override_stat: false,
+         }
+     }
+ 
+@@ -398,6 +407,29 @@ mod tests {
+     use super::*;
+     use std::path::PathBuf;
+ 
++    #[test]
++    fn override_stat_is_explicit_and_survives_record_roundtrip() {
++        let source = std::env::temp_dir();
++        let mounts = HostMount::parse(&[
++            format!("{}:/website-workspaces:override-stat", source.display()),
++            format!("{}:/control:ro", source.display()),
++        ])
++        .unwrap();
++        assert!(mounts[0].override_stat);
++        assert!(!mounts[1].override_stat);
++
++        let (live, staged) = HostMount::split_storage_tuples(&mounts);
++        let mut record =
++            crate::config::VmRecord::new("website".into(), 1, 512, live, vec![], false);
++        record.staged_mounts = staged;
++        record.override_stat_targets = vec!["/website-workspaces".into()];
++        let loaded: crate::config::VmRecord =
++            serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
++        let restored = loaded.host_mounts();
++        assert!(restored[0].override_stat);
++        assert!(!restored[1].override_stat);
++    }
++
+     #[test]
+     fn parse_rejects_duplicate_target() {
+         // Sources must exist (HostMount::_parse validates source presence),
+diff --git a/src/embedded/control.rs b/src/embedded/control.rs
+index 444b947..af96d76 100644
+--- a/src/embedded/control.rs
++++ b/src/embedded/control.rs
+@@ -72,6 +72,12 @@ impl MachineSpec {
+             self.resources.network,
+         );
+         record.staged_mounts = staged_mounts;
++        record.override_stat_targets = self
++            .mounts
++            .iter()
++            .filter(|mount| mount.override_stat)
++            .map(|mount| mount.target.to_string_lossy().into_owned())
++            .collect();
+         record.storage_gb = self.resources.storage_gib;
+         record.overlay_gb = self.resources.overlay_gib;
+         record.block_io = self.resources.block_io;
+diff --git a/src/vm/backend/libkrun.rs b/src/vm/backend/libkrun.rs
+index fb70973..b28b1e1 100644
+--- a/src/vm/backend/libkrun.rs
++++ b/src/vm/backend/libkrun.rs
+@@ -116,6 +116,7 @@ impl LibkrunVm {
+             let krun_set_exec = krun.set_exec;
+             let krun_add_virtiofs = krun.add_virtiofs;
+             let krun_add_virtiofs3 = krun.add_virtiofs3;
++            let krun_add_virtiofs4 = krun.add_virtiofs4;
+             let krun_set_port_map = krun.set_port_map;
+             let krun_add_disk2 = krun.add_disk2;
+             let krun_add_vsock = krun.add_vsock;
+@@ -254,14 +255,38 @@ impl LibkrunVm {
+                 // `krun_add_virtiofs3` is already unwrapped above (the root fs
+                 // requires it), so use it directly with the shared policy.
+                 let dax_window = crate::agent::virtiofs::user_mount_dax_window(&mount.target);
+-                let ret = krun_add_virtiofs3(
+-                    ctx,
+-                    tag.as_ptr(),
+-                    path.as_ptr(),
+-                    dax_window,
+-                    mount.read_only,
+-                );
++                let ret = if mount.override_stat {
++                    let Some(add_virtiofs4) = krun_add_virtiofs4 else {
++                        krun_free_ctx(ctx);
++                        return Err(Error::vm_creation(
++                            "override-stat mount requires libkrun with krun_add_virtiofs4",
++                        ));
++                    };
++                    add_virtiofs4(
++                        ctx,
++                        tag.as_ptr(),
++                        path.as_ptr(),
++                        dax_window,
++                        mount.read_only,
++                        crate::agent::KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT,
++                    )
++                } else {
++                    krun_add_virtiofs3(
++                        ctx,
++                        tag.as_ptr(),
++                        path.as_ptr(),
++                        dax_window,
++                        mount.read_only,
++                    )
++                };
+                 if ret < 0 {
++                    if mount.override_stat {
++                        krun_free_ctx(ctx);
++                        return Err(Error::vm_creation(format!(
++                            "krun_add_virtiofs4 failed for '{}'",
++                            mount.source.display()
++                        )));
++                    }
+                     tracing::warn!(
+                         "failed to add virtiofs mount: {} -> {}",
+                         mount.source.display(),
+diff --git a/src/vm/config.rs b/src/vm/config.rs
+index bd6a76d..d788a7e 100644
+--- a/src/vm/config.rs
++++ b/src/vm/config.rs
+@@ -470,6 +470,7 @@ mod tests {
+                 target: "/guest".into(),
+                 read_only: true,
+                 staged: false,
++                override_stat: false,
+             })
+             .command(vec!["/bin/sh".to_string()])
+             .workdir("/app")

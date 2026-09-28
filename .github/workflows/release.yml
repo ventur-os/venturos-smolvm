@@ -1,0 +1,57 @@
+name: Release Website smolvm
+
+on:
+  push:
+    tags:
+      - 'v1.17.0-venturos.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build pinned upstream source
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential libssl-dev pkg-config e2fsprogs patchelf git-lfs
+          rustup toolchain install 1.98.1 --profile minimal
+          GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 --branch v1.17.0 https://github.com/smol-machines/smolvm.git upstream
+          cd upstream
+          test "$(git rev-parse HEAD)" = d33b5a4adeb844365922cd2a29a89d93a94008ad
+          git lfs pull
+          git apply --check ../patches/override-stat.patch
+          git apply ../patches/override-stat.patch
+          ./scripts/check-libkrun-provenance.sh
+          objdump -T lib/linux-x86_64/libkrun.so | grep -q krun_add_virtiofs4
+          cargo +1.98.1 fmt --check
+          export LIBKRUN_BUNDLE="$PWD/lib/linux-x86_64"
+          cargo +1.98.1 test --locked --lib override_stat_is_explicit_and_survives_record_roundtrip
+          cargo +1.98.1 test --locked --lib test_type_conversions
+          cargo +1.98.1 build --locked --release --bin smolvm
+      - name: Package with pinned upstream runtime assets
+        run: |
+          set -euo pipefail
+          archive=smolvm-1.17.0-linux-x86_64.tar.gz
+          curl -fsSL --retry 5 --retry-delay 5 -o "$archive" "https://github.com/smol-machines/smolvm/releases/download/v1.17.0/$archive"
+          echo "b648e6aa47dc4fee1ddc255f5c11401fc6aab41bab61335bde903ad2fc2e1bd1  $archive" | sha256sum -c -
+          mkdir bundle
+          tar -xzf "$archive" -C bundle
+          cd bundle/smolvm-1.17.0-linux-x86_64
+          cp ../../upstream/target/release/smolvm smolvm-bin
+          sha256sum smolvm smolvm-bin lib/* > checksums.txt
+          sha256sum -c checksums.txt
+          cd ..
+          tar -czf ../../smolvm-1.17.0-venturos-linux-x86_64.tar.gz smolvm-1.17.0-linux-x86_64
+          cd ../..
+          sha256sum smolvm-1.17.0-venturos-linux-x86_64.tar.gz > smolvm-1.17.0-venturos-linux-x86_64.tar.gz.sha256
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" smolvm-1.17.0-venturos-linux-x86_64.tar.gz smolvm-1.17.0-venturos-linux-x86_64.tar.gz.sha256 --verify-tag --title "$GITHUB_REF_NAME" --notes "Pinned smolvm v1.17.0 with Website-only override-stat volume support."
