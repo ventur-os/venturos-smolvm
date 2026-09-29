@@ -546,7 +546,7 @@ index 6e48b2f..cb5b8b9 100644
              .collect::<std::collections::VecDeque<_>>();
          let staged = self
 diff --git a/src/data/storage.rs b/src/data/storage.rs
-index 54d3b5c..4f10e4b 100644
+index 54d3b5c..385a7c8 100644
 --- a/src/data/storage.rs
 +++ b/src/data/storage.rs
 @@ -43,6 +43,10 @@ pub struct HostMount {
@@ -653,6 +653,14 @@ index 54d3b5c..4f10e4b 100644
      #[test]
      fn parse_rejects_duplicate_target() {
          // Sources must exist (HostMount::_parse validates source presence),
+@@ -567,6 +599,7 @@ mod tests {
+                 target: PathBuf::from("/guest/path"),
+                 read_only: true,
+                 staged: false,
++                override_stat: false,
+             };
+             let err = HostMount::validate(&mount).unwrap_err().to_string();
+             assert!(
 diff --git a/src/embedded/control.rs b/src/embedded/control.rs
 index 444b947..af96d76 100644
 --- a/src/embedded/control.rs
