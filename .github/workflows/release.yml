@@ -46,9 +46,8 @@ jobs:
           cp ../../upstream/target/release/smolvm smolvm-bin
           sha256sum smolvm smolvm-bin lib/* > checksums.txt
           sha256sum -c checksums.txt
-          cd ..
-          tar -czf ../../smolvm-1.17.0-venturos-linux-x86_64.tar.gz smolvm-1.17.0-linux-x86_64
           cd ../..
+          tar -C bundle -czf smolvm-1.17.0-venturos-linux-x86_64.tar.gz smolvm-1.17.0-linux-x86_64
           sha256sum smolvm-1.17.0-venturos-linux-x86_64.tar.gz > smolvm-1.17.0-venturos-linux-x86_64.tar.gz.sha256
       - name: Publish tagged release
         if: startsWith(github.ref, 'refs/tags/')
