@@ -2,9 +2,9 @@ diff --git a/README.md b/README.md
 index 12e0fc8..88d2821 100644
 --- a/README.md
 +++ b/README.md
-@@ -232,6 +232,14 @@ machine needs a stop/start to apply it. DAX does not materially accelerate
- metadata-heavy traversal. Confirm it in the guest with
- `grep virtiofs /proc/mounts`; an active mount includes `dax=always`.
+@@ -108,6 +108,14 @@
+ How It Works
+ ------------
  
 +On Linux, a writable host volume whose files carry
 +`user.containers.override_stat` metadata can opt in per mount with
@@ -14,9 +14,9 @@ index 12e0fc8..88d2821 100644
 +and mode handling. The selected volume requires a libkrun that exports
 +`krun_add_virtiofs4` and a host filesystem that supports the xattr.
 +
- **Use git and SSH without copying private keys into the guest.** Forward your host SSH agent into the VM. The guest can ask the agent to sign with any forwarded key while the socket is available, so forward it only to workloads you trust. Requires an SSH agent running on your host (`ssh-add -l` to check).
+ Each workload runs in a hardware-virtualized VM with its own guest kernel on [Hypervisor.framework](https://developer.apple.com/documentation/hypervisor) (macOS), KVM (Linux), or the [Windows Hypervisor Platform](https://learn.microsoft.com/en-us/virtualization/api/) (Windows). [libkrun](https://github.com/containers/libkrun) is the VMM and [libkrunfw](https://github.com/smol-machines/libkrunfw) supplies the guest kernel. Images use the [OCI](https://opencontainers.org/) format, so anything on Docker Hub, ghcr.io or another registry boots as a microVM, with no Docker daemon.
  
- ```bash
+ Defaults: 4 vCPUs, 8 GiB RAM. Memory is elastic via virtio balloon and idle vCPUs sleep in the hypervisor, so over-provisioning costs almost nothing. Override with `--cpus` and `--mem`.
 diff --git a/src/agent/launcher.rs b/src/agent/launcher.rs
 index 22867f8..65014e7 100644
 --- a/src/agent/launcher.rs
@@ -133,14 +133,14 @@ diff --git a/src/agent/mod.rs b/src/agent/mod.rs
 index d8fe8f0..5dd59ea 100644
 --- a/src/agent/mod.rs
 +++ b/src/agent/mod.rs
-@@ -87,6 +87,7 @@ pub use client::{
-     InteractiveInput, InteractiveOutput, PullOptions, RunConfig,
+@@ -92,6 +92,7 @@ pub use client::{
+     FileWriteMeta, InputClosed, InteractiveInput, InteractiveInputReceiver, InteractiveInputSender,
+     InteractiveOutput, PullOptions, RunConfig,
  };
  pub use fsnotify_watch::FsNotifyWatcher;
 +pub(crate) use krun::KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT;
  pub use krun::{host_layers_supported, KrunFunctions};
  pub use launcher::{
-     create_disk_overlays, find_lib_dir, launch_agent_vm, DiskOverlaySpec, LaunchConfig,
 diff --git a/src/api/handlers/machines.rs b/src/api/handlers/machines.rs
 index 631a851..8a71f72 100644
 --- a/src/api/handlers/machines.rs
@@ -518,17 +518,17 @@ index 6e48b2f..cb5b8b9 100644
      /// Guest-local working trees synchronized with host directories in
      /// batches. Kept separate from `mounts` so existing records retain their
      /// tuple encoding and cannot accidentally reinterpret a staged mount as a
-@@ -720,6 +724,7 @@ impl VmRecord {
-             block_io: Default::default(),
+@@ -852,6 +856,7 @@ impl VmRecord {
              disks: Vec::new(),
+             cache_disk: None,
              mounts,
 +            override_stat_targets: Vec::new(),
              staged_mounts: Vec::new(),
              ports,
              published_sockets: Vec::new(),
-@@ -794,6 +799,7 @@ impl VmRecord {
-             block_io: Default::default(),
+@@ -941,6 +946,7 @@ impl VmRecord {
              disks: Vec::new(),
+             cache_disk: None,
              mounts,
 +            override_stat_targets: Vec::new(),
              staged_mounts: Vec::new(),
@@ -748,3 +748,13 @@ index bd6a76d..d788a7e 100644
              })
              .command(vec!["/bin/sh".to_string()])
              .workdir("/app")
+diff --git a/src/credentials.rs b/src/credentials.rs
+--- a/src/credentials.rs
++++ b/src/credentials.rs
+@@ -179,5 +179,6 @@ impl CredentialRuntime {
+             target: PathBuf::from(GUEST_CA_DIR),
+             read_only: true,
+             staged: false,
++            override_stat: false,
+         }
+     }
