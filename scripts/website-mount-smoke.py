@@ -19,7 +19,10 @@ def main():
         os.setxattr(website, "user.containers.override_stat", b"31000:31000:0755")
         (control / "sentinel").write_text("read-only")
         env = {**os.environ, "HOME": str(home), "XDG_DATA_HOME": str(home / "data"),
-               "XDG_CACHE_HOME": str(home / "cache"), "XDG_CONFIG_HOME": str(home / "config")}
+               "XDG_CACHE_HOME": str(home / "cache"), "XDG_CONFIG_HOME": str(home / "config"),
+               "DOCKER_CONFIG": str(home / ".docker"), "SMOLVM_LIB_DIR": str(binary.parent / "lib"),
+               "SMOLVM_AGENT_ROOTFS": str(binary.parent / "agent-rootfs")}
+        env.pop("SMOLVM_DATA_DIR", None)
 
         def run(*args):
             result = subprocess.run([str(binary), *args], env=env, text=True,
@@ -34,6 +37,7 @@ def main():
             assert "override-stat" in run("machine", command, "--help")
         name = "website-mount-smoke"
         run("machine", "create", "--name", name, "--cpus", "1", "--mem", "512",
+            "--image", str(binary.parent / "agent-rootfs"),
             "--storage", "1", "--overlay", "1", "--volume", f"{website}:/website-workspaces:override-stat",
             "--volume", f"{control}:/control:ro")
         try:
