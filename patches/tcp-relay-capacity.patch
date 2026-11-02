@@ -1,0 +1,120 @@
+diff --git a/crates/smolvm-network/src/stack.rs b/crates/smolvm-network/src/stack.rs
+index bbca001..e26b0fc 100644
+--- a/crates/smolvm-network/src/stack.rs
++++ b/crates/smolvm-network/src/stack.rs
+@@ -134,6 +134,33 @@ pub struct VirtioPollConfig {
+     pub mtu: usize,
+ }
+ 
++fn parse_tcp_relay_capacity(value: &str) -> Option<usize> {
++    value
++        .parse::<usize>()
++        .ok()
++        .filter(|capacity| (1..=4096).contains(capacity))
++}
++
++/// Bound the per-machine host socket, thread, and guest buffer budget even when
++/// an operator opts into more than the default 512 concurrent TCP relays.
++fn tcp_relay_capacity_from_env() -> Option<usize> {
++    let value = match std::env::var("SMOLVM_TCP_RELAY_CAPACITY") {
++        Ok(value) => value,
++        Err(std::env::VarError::NotPresent) => return None,
++        Err(error) => {
++            tracing::warn!(%error, "ignoring invalid SMOLVM_TCP_RELAY_CAPACITY");
++            return None;
++        }
++    };
++    match parse_tcp_relay_capacity(&value) {
++        Some(capacity) => Some(capacity),
++        _ => {
++            tracing::warn!(%value, "SMOLVM_TCP_RELAY_CAPACITY must be between 1 and 4096; using default");
++            None
++        }
++    }
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ enum FrameAction {
+     TcpSyn {
+@@ -249,7 +276,7 @@ fn run_network_stack(
+     ];
+     let relay_wake = Arc::new(queues.relay_wake.clone());
+     let mut relays = TcpRelayTable::new(
+-        None,
++        tcp_relay_capacity_from_env(),
+         egress.clone(),
+         gateway_addrs.to_vec(),
+         config.host_service,
+@@ -1509,3 +1536,17 @@ mod tests {
+         ));
+     }
+ }
++
++#[cfg(test)]
++mod relay_capacity_tests {
++    use super::parse_tcp_relay_capacity;
++
++    #[test]
++    fn relay_capacity_rejects_unbounded_or_invalid_values() {
++        assert_eq!(parse_tcp_relay_capacity("320"), Some(320));
++        assert_eq!(parse_tcp_relay_capacity("4096"), Some(4096));
++        for value in ["0", "4097", "-1", "100000000000000000000", "bad"] {
++            assert_eq!(parse_tcp_relay_capacity(value), None);
++        }
++    }
++}
+diff --git a/crates/smolvm-network/src/tcp_relay.rs b/crates/smolvm-network/src/tcp_relay.rs
+index 5b5fad4..9ac8ab5 100644
+--- a/crates/smolvm-network/src/tcp_relay.rs
++++ b/crates/smolvm-network/src/tcp_relay.rs
+@@ -44,7 +44,7 @@ use std::time::Duration;
+ 
+ const TCP_RX_BUFFER_BYTES: usize = 64 * 1024;
+ const TCP_TX_BUFFER_BYTES: usize = 64 * 1024;
+-const MAX_CONNECTIONS: usize = 256;
++const MAX_CONNECTIONS: usize = 512;
+ const CHANNEL_CAPACITY: usize = 32;
+ const RELAY_BUFFER_BYTES: usize = 16 * 1024;
+ const CLOSE_RETRY_LIMIT: u16 = 64;
+@@ -1144,6 +1144,27 @@ fn flush_proxy_data(socket: &mut tcp::Socket<'_>, connection: &mut TrackedConnec
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn relay_accepts_burst_beyond_old_256_limit_and_honors_configured_cap() {
++        use super::*;
++        let mut sockets = SocketSet::new(vec![]);
++        let mut table = TcpRelayTable::new(Some(320), EgressPolicy::unrestricted(), vec![], None);
++        let destination = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 443);
++        for port in 40_000..40_320 {
++            let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 96, 0, 2)), port);
++            assert!(
++                table.create_tcp_socket(source, destination, &mut sockets),
++                "flow {port}"
++            );
++        }
++        assert_eq!(table.active_connections(), 320);
++        let overflow = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 96, 0, 2)), 40_320);
++        assert!(!table.create_tcp_socket(overflow, destination, &mut sockets));
++        assert_eq!(table.active_connections(), 320);
++        assert!(
++            TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![], None).capacity() >= 320
++        );
++    }
+     #[test]
+     fn seeded_published_ports_wrap_without_reusing_live_ports() {
+         let mut table = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![], None)
+diff --git a/docs/limitations.md b/docs/limitations.md
+index b3aa8e2..59103f1 100644
+--- a/docs/limitations.md
++++ b/docs/limitations.md
+@@ -20,3 +20,9 @@ process setting (set it on `smolvm serve` for served machines), and an existing
+ machine needs a stop/start to apply it. DAX does not materially accelerate
+ metadata-heavy traversal. Confirm it in the guest with
+ `grep virtiofs /proc/mounts`; an active mount includes `dax=always`.
++
++* Virtio-net accepts up to 512 simultaneous TCP relay connections per machine by
++  default. For higher-concurrency workloads, set `SMOLVM_TCP_RELAY_CAPACITY` on
++  the host process (1–4096); this bounds the number of host relay threads and
++  their buffers. Invalid values use the default. TSI networking does not use
++  this relay table.
