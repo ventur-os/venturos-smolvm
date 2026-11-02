@@ -22,24 +22,24 @@ set -u
 gateway=$(awk '$2 == "00000000" { print $3; exit }' /proc/net/route)
 set -- $(echo "$gateway" | sed 's/\(..\)\(..\)\(..\)\(..\)/\4 \3 \2 \1/')
 host=$(printf '%d.%d.%d.%d' "0x$1" "0x$2" "0x$3" "0x$4")
-rm -f /tmp/hold /tmp/refused
+rm -f /tmp/hold /tmp/exits
 mkfifo /tmp/hold
-: > /tmp/refused
+: > /tmp/exits
 sleep 300 > /tmp/hold 2>/dev/null &
 holder=$!
 i=0
 while [ "$i" -lt FLOWS ]; do
-  # nc 1.10 reports a refused connect only with -v.
-  nc -v "$host" PORT < /tmp/hold > /dev/null 2>> /tmp/refused &
+  # nc 1.10 exits silently when its connect fails; a held flow never exits.
+  (nc "$host" PORT < /tmp/hold; echo "$?" >> /tmp/exits) > /dev/null 2>&1 &
   i=$((i + 1))
 done
 sleep 10
 remote="$gateway:$(printf '%04X' PORT)"
 established=$(awk -v remote="$remote" '$3 == remote && $4 == "01"' /proc/net/tcp | wc -l)
-refused=$(grep -c 'refused' /tmp/refused || true)
+failed=$(grep -vc '^0$' /tmp/exits || true)
 killall nc 2>/dev/null || true
 kill "$holder" 2>/dev/null || true
-echo "established=$established refused=$refused"
+echo "established=$established failed=$failed"
 """
 
 
@@ -113,7 +113,7 @@ def main():
                 print(f"capacity={capacity or 'default'} host_accepted={accepted} guest {guest} "
                       f"logged_full={len(full)}")
                 assert accepted == expected, (capacity, accepted, guest)
-                assert guest == f"established={expected} refused={FLOWS - expected}", (capacity, guest)
+                assert guest == f"established={expected} failed={FLOWS - expected}", (capacity, guest)
                 assert len(full) == FLOWS - expected, (capacity, len(full))
                 assert all(line.endswith(f"active={expected} capacity={expected}") for line in full), full[:1]
                 run("machine", "stop", "--name", name)
