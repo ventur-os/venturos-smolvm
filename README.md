@@ -5,6 +5,14 @@ This repository builds smolvm v1.25.0 with one opt-in virtiofs volume mode:
 bundle and leaves all other volumes unchanged. The [patch](patches/override-stat.patch)
 is applied to upstream commit `18a7c09fe334ab64fda0e672f3c98aebbfff64e6`.
 
+The [TCP relay capacity patch](patches/tcp-relay-capacity.patch) backports upstream
+[#1661](https://github.com/smol-machines/smolvm/pull/1661) from v1.26.0. Version 1.25.0
+accepts at most 256 concurrent virtio-net TCP flows per machine, outbound and published
+inbound combined, and resets any new flow past that. The backport raises the default to
+512 and lets the host process set `SMOLVM_TCP_RELAY_CAPACITY` (1–4096). An existing
+machine needs a stop/start to apply it. `scripts/tcp-relay-capacity-smoke.py` checks
+both limits with 600 concurrent guest flows.
+
 Tagged releases contain a Linux x86_64 tarball and its SHA-256. The VenturOS
 BYOP host installer pins that digest. The runtime must pass a live devtest guest
 write/read test before the host switches to it. Pull requests and tagged builds
