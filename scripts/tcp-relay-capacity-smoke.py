@@ -3,8 +3,8 @@
 
 The guest holds more connections open than the old fixed 256-relay table allowed,
 to a listener on the host's loopback reached through the guest gateway. Flows past
-the table capacity are refused by the userspace stack, so the host-accepted count
-equals the effective capacity.
+the table capacity are refused by the userspace stack and logged by the VMM, so the
+host-accepted count equals the effective capacity.
 """
 
 import json
@@ -29,7 +29,8 @@ sleep 300 > /tmp/hold 2>/dev/null &
 holder=$!
 i=0
 while [ "$i" -lt FLOWS ]; do
-  nc "$host" PORT < /tmp/hold > /dev/null 2>> /tmp/refused &
+  # nc 1.10 reports a refused connect only with -v.
+  nc -v "$host" PORT < /tmp/hold > /dev/null 2>> /tmp/refused &
   i=$((i + 1))
 done
 sleep 10
@@ -106,9 +107,15 @@ def main():
                 run("machine", "start", "--name", name, extra=extra)
                 guest = run("machine", "exec", "--name", name, "--", "sh", "-c", script)
                 accepted = len(listener.accepted)
-                print(f"capacity={capacity or 'default'} host_accepted={accepted} guest {guest}")
+                log = Path(run("machine", "data-dir", "--name", name)) / "agent-startup-error.log"
+                full = [line for line in log.read_text(errors="replace").splitlines()
+                        if "relay table is full" in line]
+                print(f"capacity={capacity or 'default'} host_accepted={accepted} guest {guest} "
+                      f"logged_full={len(full)}")
                 assert accepted == expected, (capacity, accepted, guest)
                 assert guest == f"established={expected} refused={FLOWS - expected}", (capacity, guest)
+                assert len(full) == FLOWS - expected, (capacity, len(full))
+                assert all(line.endswith(f"active={expected} capacity={expected}") for line in full), full[:1]
                 run("machine", "stop", "--name", name)
                 listener.reset()
         finally:
